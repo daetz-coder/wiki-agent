@@ -1,0 +1,8 @@
+INFO:     Will watch for changes in these directories: ['D:\\2026Agent\\wiki-agent\\backend']
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:     Started reloader process [4920] using WatchFiles
+INFO:     Started server process [7112]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'app\agent\knowledge_extractor.py'. Reloading...
+ 
