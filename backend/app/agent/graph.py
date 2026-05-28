@@ -57,6 +57,11 @@ class WikiState(TypedDict, total=False):
 
 
 def _get_configurable(config: RunnableConfig) -> dict:
+    """
+    Get the configurable from the config.
+    :param config: The config.
+    :return: The configurable.
+    """
     return (config or {}).get("configurable") or {}
 
 
@@ -221,6 +226,11 @@ def should_execute(state: WikiState) -> Literal["execute", "end"]:
 
 
 def create_wiki_graph(checkpointer):
+    """
+    Create the wiki agent graph.
+    :param checkpointer: The checkpointer.
+    :return: The wiki agent graph.
+    """
     graph = StateGraph(WikiState)
     graph.add_node("search", search)
     graph.add_node("respond", respond)
@@ -238,6 +248,10 @@ _wiki_graph = None
 
 
 async def get_wiki_graph():
+    """
+    Get the wiki agent graph.
+    :return: The wiki agent graph.
+    """
     global _wiki_graph
     if _wiki_graph is None:
         conn = await aiosqlite.connect(_CHECKPOINT_DB)
@@ -247,6 +261,12 @@ async def get_wiki_graph():
 
 
 def _extraction_from_result(result: dict, thread_id: str) -> dict | None:
+    """
+    Get the extraction from the result.
+    :param result: The result.
+    :param thread_id: The thread id.
+    :return: The extraction.
+    """
     decision = result.get("decision")
     if not decision or decision.get("action") == "none":
         return None

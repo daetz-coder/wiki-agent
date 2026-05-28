@@ -38,6 +38,11 @@ class ConfirmRequest(BaseModel):
 
 
 async def _ensure_session(session_id: str):
+    """
+    If id doesn't exist, create a new session
+    :param session_id:
+    :return:
+    """
     if not await session_store.session_exists(session_id):
         await session_store.create_session(session_id)
 
@@ -53,7 +58,12 @@ def _build_history(messages: list[dict]) -> list:
 
 
 async def stream_response(session_id: str, user_message: str) -> AsyncGenerator[str, None]:
-    """SSE 流式对话 — 经 LangGraph: search → respond → decide → [interrupt]"""
+    """
+    This function is used to stream the response from the LangGraph.
+    :param session_id: The session id.
+    :param user_message: The user message.
+    :return: The stream response.
+    """
     await _ensure_session(session_id)
 
     session_data = await session_store.get_session(session_id)
