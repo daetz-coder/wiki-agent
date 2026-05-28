@@ -1,9 +1,10 @@
-"""Wiki API 路由"""
+"""Wiki API 路由 — 写操作经 WikiSyncManager 同步 Markdown + ChromaDB + BM25 + Git"""
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.agent.tools.sync_manager import sync_manager
 from app.wiki import service, git_service
 from app.wiki.schemas import (
     WikiPageCreate,
@@ -16,6 +17,18 @@ from app.wiki.schemas import (
 )
 
 router = APIRouter(prefix="/api/wiki", tags=["wiki"])
+
+
+def _raise_on_sync_error(result: dict) -> None:
+    """将 sync_manager 返回的错误映射为 HTTP 异常"""
+    if result.get("status") != "error":
+        return
+    msg = result.get("message", "操作失败")
+    if "已存在" in msg:
+        raise HTTPException(409, msg)
+    if "不存在" in msg:
+        raise HTTPException(404, msg)
+    raise HTTPException(500, msg)
 
 
 # ── 目录树 ──────────────────────────────────────────────────
@@ -53,14 +66,13 @@ def get_history(path: str, limit: int = 20):
 
 @router.post("/page/{path:path}/rollback")
 def rollback(path: str, commit_hash: str):
-    """回滚条目到指定版本"""
-    ok = git_service.rollback(path, commit_hash)
-    if not ok:
-        raise HTTPException(400, "回滚失败")
+    """回滚条目到指定版本，并同步 ChromaDB + BM25"""
+    result = sync_manager.rollback(path, commit_hash)
+    _raise_on_sync_error(result)
     return {"status": "ok", "message": f"已回滚到 {commit_hash}"}
 
 
-# ── CRUD ────────────────────────────────────────────────────
+# ── CRUD（经 WikiSyncManager 三端同步）──────────────────────
 
 
 @router.get("/page/{path:path}", response_model=WikiPage)
@@ -75,42 +87,38 @@ def get_page(path: str):
 @router.post("/page/{path:path}", response_model=WikiPage, status_code=201)
 def create_page(path: str, data: WikiPageCreate):
     """创建知识条目"""
-    try:
-        page = service.create_page(path, data)
-        git_service.commit_changes(
-            f"新建条目: {data.title}",
-            files=[path],
-        )
-        return page
-    except FileExistsError as e:
-        raise HTTPException(409, str(e))
+    result = sync_manager.create(
+        path=path,
+        title=data.title,
+        content=data.content,
+        tags=data.tags,
+        source=data.source,
+        git_message=f"新建条目: {data.title}",
+    )
+    _raise_on_sync_error(result)
+    return service.get_page(path)
 
 
 @router.put("/page/{path:path}", response_model=WikiPage)
 def update_page(path: str, data: WikiPageUpdate):
     """更新知识条目"""
-    try:
-        page = service.update_page(path, data)
-        git_service.commit_changes(
-            f"更新条目: {page.title}",
-            files=[path],
-        )
-        return page
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
+    result = sync_manager.update(
+        path=path,
+        title=data.title,
+        content=data.content,
+        tags=data.tags,
+        links=data.links,
+        git_message=f"更新条目: {data.title or path}",
+    )
+    _raise_on_sync_error(result)
+    return service.get_page(path)
 
 
 @router.delete("/page/{path:path}", status_code=204)
 def delete_page(path: str):
     """删除知识条目"""
-    try:
-        service.delete_page(path)
-        git_service.commit_changes(
-            f"删除条目: {path}",
-            files=[path],
-        )
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
+    result = sync_manager.delete(path, git_message=f"删除条目: {path}")
+    _raise_on_sync_error(result)
 
 
 # ── 导入 ────────────────────────────────────────────────────
@@ -119,26 +127,11 @@ def delete_page(path: str):
 @router.post("/import", response_model=WikiPage, status_code=201)
 def import_markdown(data: WikiImportRequest):
     """导入 Markdown 内容"""
-    try:
-        if data.overwrite:
-            page = service.update_page(
-                data.path,
-                WikiPageUpdate(content=data.content, source=data.source),
-            )
-        else:
-            title = data.path.rsplit("/", 1)[-1].replace(".md", "")
-            if data.content.startswith("# "):
-                title = data.content.split("\n")[0][2:].strip()
-            page = service.create_page(
-                data.path,
-                WikiPageCreate(
-                    title=title, content=data.content, source=data.source
-                ),
-            )
-        git_service.commit_changes(
-            f"导入条目: {page.title} (来源: {data.source})",
-            files=[data.path],
-        )
-        return page
-    except FileExistsError:
-        raise HTTPException(409, f"条目已存在: {data.path}，使用 overwrite=true 覆盖")
+    result = sync_manager.import_markdown(
+        path=data.path,
+        content=data.content,
+        source=data.source,
+        overwrite=data.overwrite,
+    )
+    _raise_on_sync_error(result)
+    return service.get_page(data.path)

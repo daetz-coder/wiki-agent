@@ -1,6 +1,7 @@
 """WikiSyncManager — Wiki 数据库同步管理器
 
-确保 Markdown 文件、ChromaDB 向量索引、Git 版本 三者一致
+确保 Markdown、ChromaDB、BM25、Git 四端一致。
+所有写操作（REST API、Agent CRUD）应经此模块。
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ class WikiSyncManager:
         content: str,
         tags: list[str] | None = None,
         source: str = "agent",
+        git_message: str | None = None,
     ) -> dict:
         """创建知识条目
 
@@ -90,9 +92,8 @@ class WikiSyncManager:
             # Step 2: 更新 ChromaDB 向量索引
             self._sync_to_chroma(path, title, content, tags or [])
 
-            # Step 3: Git 提交
             git_service.commit_changes(
-                f"创建知识: {title}",
+                git_message or f"创建知识: {title}",
                 files=[path],
             )
 
@@ -119,6 +120,8 @@ class WikiSyncManager:
         title: str | None = None,
         content: str | None = None,
         tags: list[str] | None = None,
+        links: list[str] | None = None,
+        git_message: str | None = None,
     ) -> dict:
         """更新知识条目
 
@@ -144,6 +147,7 @@ class WikiSyncManager:
                     title=title,
                     content=content,
                     tags=tags,
+                    links=links,
                 ),
             )
 
@@ -153,9 +157,8 @@ class WikiSyncManager:
             updated_tags = tags or page.tags
             self._sync_to_chroma(path, updated_title, updated_content, updated_tags)
 
-            # Step 3: Git 提交
             git_service.commit_changes(
-                f"更新知识: {page.title}",
+                git_message or f"更新知识: {page.title}",
                 files=[path],
             )
 
@@ -176,7 +179,7 @@ class WikiSyncManager:
                 "message": f"更新失败: {str(e)}",
             }
 
-    def delete(self, path: str) -> dict:
+    def delete(self, path: str, git_message: str | None = None) -> dict:
         """删除知识条目
 
         流程:
@@ -197,9 +200,8 @@ class WikiSyncManager:
             # Step 2: 删除 ChromaDB 向量
             self._delete_from_chroma(path)
 
-            # Step 3: Git 提交
             git_service.commit_changes(
-                f"删除知识: {path}",
+                git_message or f"删除知识: {path}",
                 files=[path],
             )
 
@@ -219,6 +221,50 @@ class WikiSyncManager:
                 "status": "error",
                 "message": f"删除失败: {str(e)}",
             }
+
+    def reindex_page(self, path: str) -> dict:
+        """根据磁盘上的 Markdown 重建 ChromaDB + BM25 索引（用于 Git 回滚等）"""
+        try:
+            page = service.get_page(path)
+            self._sync_to_chroma(path, page.title, page.content, page.tags or [])
+            return {"status": "ok", "path": path, "message": f"已重建索引: {page.title}"}
+        except FileNotFoundError:
+            self._delete_from_chroma(path)
+            return {"status": "ok", "path": path, "message": f"条目已删除，已清理索引: {path}"}
+        except Exception as e:
+            return {"status": "error", "message": f"索引同步失败: {str(e)}"}
+
+    def rollback(self, path: str, commit_hash: str) -> dict:
+        """Git 回滚文件内容，并同步 ChromaDB + BM25"""
+        ok = git_service.rollback(path, commit_hash)
+        if not ok:
+            return {"status": "error", "message": "回滚失败"}
+        return self.reindex_page(path)
+
+    def import_markdown(
+        self,
+        path: str,
+        content: str,
+        source: str = "import",
+        overwrite: bool = False,
+    ) -> dict:
+        """导入 Markdown（创建或覆盖）"""
+        if overwrite:
+            return self.update(
+                path,
+                content=content,
+                git_message=f"导入覆盖: {path} (来源: {source})",
+            )
+        title = path.rsplit("/", 1)[-1].replace(".md", "")
+        if content.startswith("# "):
+            title = content.split("\n")[0][2:].strip()
+        return self.create(
+            path,
+            title=title,
+            content=content,
+            source=source,
+            git_message=f"导入条目: {title} (来源: {source})",
+        )
 
     def _sync_to_chroma(
         self,
