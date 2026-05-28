@@ -1,28 +1,51 @@
-"""Wiki Agent — 统一的知识助手 Agent
-
-职责:
-- 搜索知识库
-- 生成回复（结合知识库内容）
-- 决策是否需要更新知识库
-- 执行 CRUD 操作（需用户确认后执行，Human-in-the-Loop）
-"""
+"""Wiki Agent — LangGraph 编排（search → respond → decide → execute）"""
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
-from typing import Literal, TypedDict
+from collections.abc import AsyncGenerator
+from typing import Any, Literal, TypedDict
 
-from langgraph.graph import StateGraph, END
+import aiosqlite
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import interrupt, Command
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
 
 from app.agent import knowledge_agent
-from app.agent.tools import search_tools, crud_tools
+from app.agent.tools import crud_tools, search_tools
+from app.config import settings
+
+_CHECKPOINT_DB = os.path.join(os.path.dirname(settings.DB_PATH), "checkpoints.db")
+os.makedirs(os.path.dirname(_CHECKPOINT_DB), exist_ok=True)
+
+SYSTEM_PROMPT = """你是一个智能知识助手。请用中文回答。
+
+## 你的能力
+1. 用你的知识详细回答用户的各种问题
+2. 搜索用户的个人知识库，如果有相关内容则引用并提供链接
+
+## 回答要求
+- 回答要详细、有结构、有价值
+- 如果知识库有相关内容，在回答中引用并标注来源路径
+- 如果知识库没有相关内容，直接用你的知识回答，不需要提及知识库
+- 不要只说"已搜索"或"未找到"，要真正回答用户的问题
+"""
+
+chat_llm = ChatOpenAI(
+    model=settings.ZHIPUAI_CHAT_MODEL,
+    api_key=settings.ZHIPUAI_API_KEY,
+    base_url=settings.ZHIPUAI_BASE_URL,
+    temperature=0.7,
+    streaming=True,
+)
 
 
-# ── 状态定义 ──────────────────────────────────────────────────
-
-class WikiState(TypedDict):
+class WikiState(TypedDict, total=False):
     """Wiki Agent 共享状态"""
     user_message: str
     wiki_results: list[dict]
@@ -30,35 +53,55 @@ class WikiState(TypedDict):
     ai_response: str
     decision: dict | None
     action_result: dict | None
-    stage: str  # search → respond → decide → execute → done
+    stage: str
 
 
-# ── Checkpoint 存储（持久化到 SQLite，重启不丢失）────────────────
-
-import os
-import aiosqlite
-from app.config import settings
-
-_CHECKPOINT_DB = os.path.join(os.path.dirname(settings.DB_PATH), "checkpoints.db")
-os.makedirs(os.path.dirname(_CHECKPOINT_DB), exist_ok=True)
+def _get_configurable(config: RunnableConfig) -> dict:
+    return (config or {}).get("configurable") or {}
 
 
-# ── 节点函数 ──────────────────────────────────────────────────
+def _build_llm_messages(state: WikiState, chat_history: list[BaseMessage]) -> list[BaseMessage]:
+    """根据图状态与会话历史构建 LLM 消息列表"""
+    user_message = state["user_message"]
+    wiki_text = state.get("wiki_text")
+
+    history = list(chat_history)
+    if history and isinstance(history[-1], HumanMessage) and history[-1].content == user_message:
+        prior = history[:-1]
+    else:
+        prior = history
+
+    if wiki_text:
+        context_msg = (
+            f"[知识库搜索结果]\n{wiki_text}\n\n"
+            "请结合以上知识库内容回答用户问题。如果知识库有相关内容，在回答中标注来源路径。"
+        )
+        return [
+            SystemMessage(content=SYSTEM_PROMPT),
+            *prior,
+            SystemMessage(content=context_msg),
+            HumanMessage(content=user_message),
+        ]
+    return [SystemMessage(content=SYSTEM_PROMPT), *prior, HumanMessage(content=user_message)]
+
+
+async def _emit(queue: asyncio.Queue | None, event: dict) -> None:
+    if queue is not None:
+        await queue.put(event)
+
+
+# ── 节点 ──────────────────────────────────────────────────────
+
 
 async def search(state: WikiState) -> WikiState:
-    """Wiki Agent: 搜索知识库"""
+    """混合检索知识库"""
     print("[Wiki Agent] 搜索知识库...")
     user_message = state["user_message"]
-
-    # 混合搜索
     results = search_tools.hybrid_search(user_message, limit=3)
 
-    # 格式化结果
     wiki_text = None
     if results:
-        lines = []
-        for r in results[:3]:
-            lines.append(f"- {r['title']} ({r['path']}): {r['snippet']}")
+        lines = [f"- {r['title']} ({r['path']}): {r['snippet']}" for r in results[:3]]
         wiki_text = "\n".join(lines)
 
     return {
@@ -69,18 +112,38 @@ async def search(state: WikiState) -> WikiState:
     }
 
 
-async def respond(state: WikiState) -> WikiState:
-    """Wiki Agent: 生成回复（占位，实际回复在流式处理中生成）"""
+async def respond(state: WikiState, config: RunnableConfig) -> WikiState:
+    """流式或非流式生成回复"""
     print("[Wiki Agent] 生成回复...")
-    return {
-        **state,
-        "stage": "respond",
-    }
+    configurable = _get_configurable(config)
+    queue: asyncio.Queue | None = configurable.get("event_queue")
+    chat_history: list[BaseMessage] = configurable.get("chat_history") or []
+
+    wiki_text = state.get("wiki_text")
+    if wiki_text:
+        await _emit(queue, {"type": "wiki_results", "results": wiki_text})
+
+    messages = _build_llm_messages(state, chat_history)
+    collected = ""
+
+    if queue is not None:
+        async for chunk in chat_llm.astream(messages):
+            if chunk.content:
+                collected += chunk.content
+                await _emit(queue, {"type": "content", "text": chunk.content})
+    else:
+        response = await chat_llm.ainvoke(messages)
+        collected = response.content or ""
+
+    return {**state, "ai_response": collected, "stage": "respond"}
 
 
-async def decide(state: WikiState) -> WikiState:
-    """Wiki Agent: 分析对话，决定是否需要更新知识库"""
+async def decide(state: WikiState, config: RunnableConfig) -> WikiState:
+    """分析对话，决定知识库操作"""
     print("[Wiki Agent] 分析对话...")
+    configurable = _get_configurable(config)
+    queue: asyncio.Queue | None = configurable.get("event_queue")
+
     user_message = state["user_message"]
     ai_response = state.get("ai_response", "")
 
@@ -91,25 +154,20 @@ async def decide(state: WikiState) -> WikiState:
             "stage": "decide",
         }
 
-    # 调用 Knowledge Agent 决策
+    await _emit(queue, {"type": "status", "message": "正在分析对话内容..."})
+
     decision = await knowledge_agent.decide_action(user_message, ai_response)
     decision_dict = decision.to_dict()
 
-    # title 为空时从 path 推导
     if not decision_dict.get("title") and decision_dict.get("path"):
         stem = decision_dict["path"].replace(".md", "").split("/")[-1]
         decision_dict["title"] = stem
 
-    return {
-        **state,
-        "decision": decision_dict,
-        "stage": "decide",
-    }
+    return {**state, "decision": decision_dict, "stage": "decide"}
 
 
 async def execute(state: WikiState) -> WikiState:
-    """Wiki Agent: 执行知识库操作（interrupt() 暂停等待用户确认）"""
-    # interrupt() 返回 Command(resume=...) 传入的值（True/False）
+    """Human-in-the-Loop：等待用户确认后执行 CRUD"""
     user_confirmed = interrupt({})
 
     if not user_confirmed:
@@ -122,11 +180,7 @@ async def execute(state: WikiState) -> WikiState:
 
     decision = state.get("decision")
     if not decision or decision.get("action") == "none":
-        return {
-            **state,
-            "action_result": None,
-            "stage": "execute",
-        }
+        return {**state, "action_result": None, "stage": "execute"}
 
     action = decision.get("action")
     print(f"[Wiki Agent] 用户确认，执行操作: {action}")
@@ -137,7 +191,7 @@ async def execute(state: WikiState) -> WikiState:
             title=decision.get("title", ""),
             content=decision.get("content", ""),
             category=decision.get("category", ""),
-            tags=decision.get("tags", []),
+            tags=decision.get("tags") or [],
         )
     elif action == "update":
         result = crud_tools.update_knowledge(
@@ -149,17 +203,10 @@ async def execute(state: WikiState) -> WikiState:
         result = crud_tools.delete_knowledge(decision.get("path", ""))
 
     print(f"[Wiki Agent] 执行结果: {result}")
-    return {
-        **state,
-        "action_result": result,
-        "stage": "execute",
-    }
+    return {**state, "action_result": result, "stage": "execute"}
 
-
-# ── 条件路由 ──────────────────────────────────────────────────
 
 def should_decide(state: WikiState) -> Literal["decide", "end"]:
-    """决定是否需要分析对话"""
     ai_response = state.get("ai_response", "")
     if ai_response and len(ai_response) > 50:
         return "decide"
@@ -167,71 +214,30 @@ def should_decide(state: WikiState) -> Literal["decide", "end"]:
 
 
 def should_execute(state: WikiState) -> Literal["execute", "end"]:
-    """决定是否需要执行操作"""
     decision = state.get("decision")
     if decision and decision.get("action") != "none":
         return "execute"
     return "end"
 
 
-# ── 构建图 ──────────────────────────────────────────────────
-
 def create_wiki_graph(checkpointer):
-    """创建 Wiki Agent 编排图
-
-    流程:
-    1. search: 搜索知识库
-    2. respond: 生成回复（外部处理）
-    3. decide: 分析对话，决定操作
-    4. [interrupt] → 等待用户确认
-    5. execute: 执行 CRUD 操作（用户确认后才执行）
-
-    Returns:
-        CompiledStateGraph: 编译后的图（带 checkpoint + interrupt）
-    """
     graph = StateGraph(WikiState)
-
-    # 添加节点
     graph.add_node("search", search)
     graph.add_node("respond", respond)
     graph.add_node("decide", decide)
     graph.add_node("execute", execute)
-
-    # 设置入口
     graph.set_entry_point("search")
-
-    # 添加边
     graph.add_edge("search", "respond")
-    graph.add_conditional_edges(
-        "respond",
-        should_decide,
-        {
-            "decide": "decide",
-            "end": END,
-        },
-    )
-    graph.add_conditional_edges(
-        "decide",
-        should_execute,
-        {
-            "execute": "execute",
-            "end": END,
-        },
-    )
+    graph.add_conditional_edges("respond", should_decide, {"decide": "decide", "end": END})
+    graph.add_conditional_edges("decide", should_execute, {"execute": "execute", "end": END})
     graph.add_edge("execute", END)
-
-    # 编译：启用 checkpoint（interrupt 在 execute 节点内部调用）
     return graph.compile(checkpointer=checkpointer)
 
 
-# ── 便捷函数 ──────────────────────────────────────────────────
-
-# 全局图实例
 _wiki_graph = None
 
 
 async def get_wiki_graph():
-    """获取 Wiki Agent 图实例（延迟异步初始化）"""
     global _wiki_graph
     if _wiki_graph is None:
         conn = await aiosqlite.connect(_CHECKPOINT_DB)
@@ -240,99 +246,119 @@ async def get_wiki_graph():
     return _wiki_graph
 
 
-async def run_search(user_message: str) -> tuple[list[dict], str | None]:
-    """运行搜索阶段
-
-    Args:
-        user_message: 用户消息
-
-    Returns:
-        tuple: (搜索结果列表, 格式化文本)
-    """
-    results = search_tools.hybrid_search(user_message, limit=3)
-
-    wiki_text = None
-    if results:
-        lines = []
-        for r in results[:3]:
-            lines.append(f"- {r['title']} ({r['path']}): {r['snippet']}")
-        wiki_text = "\n".join(lines)
-
-    return results, wiki_text
-
-
-async def run_decide(
-    user_message: str,
-    ai_response: str,
-) -> dict | None:
-    """运行决策阶段（不执行操作，等待用户确认）
-
-    Args:
-        user_message: 用户消息
-        ai_response: AI 回复
-
-    Returns:
-        dict: 决策结果（含 thread_id 用于后续 resume），action=none 时返回 None
-    """
-    if not ai_response or len(ai_response) < 50:
-        return None
-
-    graph = await get_wiki_graph()
-    thread_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # 运行图到 execute 节点内部的 interrupt() 暂停
-    result = await graph.ainvoke(
-        {
-            "user_message": user_message,
-            "ai_response": ai_response,
-        },
-        config,
-    )
-
+def _extraction_from_result(result: dict, thread_id: str) -> dict | None:
     decision = result.get("decision")
     if not decision or decision.get("action") == "none":
-        print("[Wiki Agent] 无需更新知识库")
         return None
+    return {**decision, "thread_id": thread_id}
 
-    print(f"[Wiki Agent] 决策: action={decision.get('action')}, reason={decision.get('reason')}")
+
+async def run_chat_stream(
+    user_message: str,
+    chat_history: list[BaseMessage],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """经 LangGraph 运行完整对话流，产出 SSE 事件 dict"""
+    graph = await get_wiki_graph()
+    thread_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread_id,
+            "event_queue": queue,
+            "chat_history": chat_history,
+        }
+    }
+
+    initial_state: WikiState = {
+        "user_message": user_message,
+        "ai_response": "",
+        "wiki_results": [],
+        "wiki_text": None,
+        "decision": None,
+        "action_result": None,
+        "stage": "",
+    }
+
+    async def _run_graph():
+        try:
+            result = await graph.ainvoke(initial_state, config)
+            extraction = _extraction_from_result(result, thread_id)
+            if extraction:
+                await queue.put({"type": "extraction", "data": extraction})
+            await queue.put({"type": "_done", "result": result})
+        except Exception as e:
+            await queue.put({"type": "error", "message": str(e)})
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(_run_graph())
+
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            if event.get("type") == "_done":
+                break
+            yield event
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+async def run_chat_invoke(
+    user_message: str,
+    chat_history: list[BaseMessage],
+) -> dict[str, Any]:
+    """非流式：经 LangGraph 完成 search → respond → decide（至 interrupt 或结束）"""
+    graph = await get_wiki_graph()
+    thread_id = str(uuid.uuid4())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread_id,
+            "event_queue": None,
+            "chat_history": chat_history,
+        }
+    }
+    initial_state: WikiState = {
+        "user_message": user_message,
+        "ai_response": "",
+        "wiki_results": [],
+        "wiki_text": None,
+        "decision": None,
+        "action_result": None,
+        "stage": "",
+    }
+    result = await graph.ainvoke(initial_state, config)
     return {
-        "thread_id": thread_id,
-        "decision": decision,
+        "content": result.get("ai_response", ""),
+        "wiki_text": result.get("wiki_text"),
+        "extraction": _extraction_from_result(result, thread_id),
     }
 
 
-async def resume_and_execute(
-    thread_id: str,
-    confirm: bool,
-) -> dict:
-    """从 checkpoint 恢复图，执行或取消操作
-
-    Args:
-        thread_id: 之前 run_decide 返回的 thread_id
-        confirm: 用户是否确认执行
-
-    Returns:
-        dict: 执行结果
-    """
+async def resume_and_execute(thread_id: str, confirm: bool) -> dict:
+    """从 checkpoint 恢复，执行或取消知识库操作"""
     graph = await get_wiki_graph()
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    # 恢复图，Command(resume=...) 传入 interrupt 返回值
     result = await graph.ainvoke(Command(resume=confirm), config)
 
     action_result = result.get("action_result")
     decision = result.get("decision", {})
 
     if action_result and action_result.get("status") == "cancelled":
-        print(f"[Wiki Agent] 用户取消: {decision.get('action')}")
         return {
             "status": "cancelled",
             "message": "用户取消操作",
             "decision": decision,
         }
 
-    print(f"[Wiki Agent] 执行完成: {action_result}")
     return {
         "status": "ok",
         "decision": decision,
