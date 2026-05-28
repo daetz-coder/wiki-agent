@@ -42,6 +42,33 @@ def commit_changes(message: str, files: list[str] | None = None) -> str | None:
     return commit.hexsha[:8]
 
 
+def _files_in_commit(commit) -> list[str]:
+    """从 diff 提取该提交涉及的路径（比 stats.files 更完整）"""
+    paths: set[str] = set()
+
+    try:
+        if commit.parents:
+            parent = commit.parents[0]
+            for diff_item in parent.diff(commit):
+                path = diff_item.b_path or diff_item.a_path
+                if path:
+                    paths.add(path.replace("\\", "/"))
+        else:
+            for item in commit.tree.traverse():
+                if item.type == "blob":
+                    paths.add(item.path.replace("\\", "/"))
+    except Exception:
+        pass
+
+    if not paths:
+        try:
+            paths.update(k.replace("\\", "/") for k in commit.stats.files.keys())
+        except Exception:
+            pass
+
+    return sorted(paths)
+
+
 def get_history(rel_path: str | None = None, limit: int = 20) -> list[WikiCommit]:
     """获取变更历史"""
     repo = _get_repo()
@@ -51,13 +78,12 @@ def get_history(rel_path: str | None = None, limit: int = 20) -> list[WikiCommit
     commits = []
     try:
         for commit in repo.iter_commits(paths=rel_path, max_count=limit):
-            files = list(commit.stats.files.keys())
             commits.append(
                 WikiCommit(
                     hash=commit.hexsha[:8],
                     message=commit.message.strip(),
                     date=commit.committed_datetime.isoformat(timespec="seconds"),
-                    files=files,
+                    files=_files_in_commit(commit),
                 )
             )
     except Exception:

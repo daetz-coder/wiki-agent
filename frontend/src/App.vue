@@ -73,6 +73,7 @@
         <HistoryPanel
           v-else-if="showHistory"
           @select="handleSelectFromHistory"
+          @rolled-back="handleRolledBack"
         />
 
         <!-- Wiki 页面 -->
@@ -237,6 +238,17 @@ async function handleSelect(path) {
 function handleSelectFromHistory(path) {
   showHistory.value = false;
   handleSelect(path);
+}
+
+async function handleRolledBack(files) {
+  await loadCategories();
+  if (currentPath.value && files.includes(currentPath.value)) {
+    try {
+      currentPage.value = await wikiApi.getPage(currentPath.value);
+    } catch (e) {
+      console.error("刷新条目失败:", e);
+    }
+  }
 }
 
 async function handleSave({ path, data }) {

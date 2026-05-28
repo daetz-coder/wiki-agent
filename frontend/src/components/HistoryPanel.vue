@@ -19,7 +19,18 @@
       >
         <div class="commit-dot"></div>
         <div class="commit-content">
-          <div class="commit-message">{{ commit.message }}</div>
+          <div class="commit-header-row">
+            <div class="commit-message">{{ commit.message }}</div>
+            <button
+              type="button"
+              class="btn-rollback"
+              :disabled="!canRollback(commit)"
+              :title="rollbackTitle(commit)"
+              @click="handleRollback(commit)"
+            >
+              {{ rollingBack === commit.hash ? "回滚中…" : "回滚到此版本" }}
+            </button>
+          </div>
           <div class="commit-meta">
             <span class="commit-hash">{{ commit.hash }}</span>
             <span class="commit-time">{{ formatTime(commit.date) }}</span>
@@ -47,10 +58,11 @@
 import { ref, onMounted } from "vue";
 import { wikiApi } from "../api/index.js";
 
-defineEmits(["select"]);
+const emit = defineEmits(["select", "rolled-back"]);
 
 const commits = ref([]);
 const loading = ref(true);
+const rollingBack = ref(null);
 
 async function loadHistory() {
   loading.value = true;
@@ -62,6 +74,53 @@ async function loadHistory() {
     commits.value = [];
   } finally {
     loading.value = false;
+  }
+}
+
+const KNOWLEDGE_FILE_RE = /\.(md|txt)$/i;
+
+function rollbackableFiles(commit) {
+  return (commit.files || []).filter((f) =>
+    KNOWLEDGE_FILE_RE.test(f.replace(/\\/g, "/"))
+  );
+}
+
+function canRollback(commit) {
+  return rollbackableFiles(commit).length > 0 && rollingBack.value !== commit.hash;
+}
+
+function rollbackTitle(commit) {
+  if (rollingBack.value === commit.hash) return "";
+  const files = rollbackableFiles(commit);
+  if (!files.length) {
+    const listed = (commit.files || []).length;
+    if (!listed) return "该提交未包含可识别的知识条目变更";
+    return "该提交的文件类型不支持回滚（仅支持 .md / .txt）";
+  }
+  return `将 ${files.length} 个条目恢复到此版本`;
+}
+
+async function handleRollback(commit) {
+  const files = rollbackableFiles(commit);
+  if (!files.length) return;
+
+  const fileList = files.join("\n");
+  const ok = confirm(
+    `确认将以下文件回滚到版本 ${commit.hash}？\n\n${fileList}\n\n回滚后会同步更新检索索引，且会产生新的 Git 提交记录。`
+  );
+  if (!ok) return;
+
+  rollingBack.value = commit.hash;
+  try {
+    for (const path of files) {
+      await wikiApi.rollback(path, commit.hash);
+    }
+    await loadHistory();
+    emit("rolled-back", files);
+  } catch (e) {
+    alert("回滚失败: " + (e.message || "未知错误"));
+  } finally {
+    rollingBack.value = null;
   }
 }
 
@@ -149,11 +208,43 @@ onMounted(loadHistory);
   padding: 14px 18px;
 }
 
+.commit-header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
 .commit-message {
   font-size: 14px;
   font-weight: 500;
   color: #1a1a1a;
-  margin-bottom: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-rollback {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #d46b08;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.btn-rollback:hover:not(:disabled) {
+  background: #ffe7ba;
+  border-color: #d46b08;
+}
+
+.btn-rollback:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .commit-meta {
